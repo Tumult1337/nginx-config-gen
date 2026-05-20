@@ -1,1 +1,13 @@
+# Build output
 nginx-gen
+dist/
+
+# Go test/coverage artifacts
+*.test
+*.out
+coverage.*
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
