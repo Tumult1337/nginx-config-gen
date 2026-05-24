@@ -170,7 +170,7 @@ func TestStaticAllowNoneNoDeny(t *testing.T) {
 }
 
 func TestMain(t *testing.T) {
-	out, err := Main(fixedTime)
+	out, err := Main(MainCfg{Now: fixedTime})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,6 +184,25 @@ func TestMain(t *testing.T) {
 	mustNotContain(t, s, "$cf_rl_key")
 	mustContain(t, s, "ssl_protocols             TLSv1.2 TLSv1.3;")
 	mustContain(t, s, "include /etc/nginx/sites-enabled/*.conf;")
+	mustNotContain(t, s, "brotli") // Brotli=false → no brotli directives
+}
+
+func TestMainWithBrotli(t *testing.T) {
+	out, err := Main(MainCfg{Now: fixedTime, Brotli: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	mustContain(t, s, "brotli            on;")
+	mustContain(t, s, "brotli_static     on;")
+	mustContain(t, s, "brotli_min_length 1024;")
+	mustContain(t, s, "brotli_types")
+	// Sanity: brotli block is inside http {} and after gzip.
+	gzipIdx := strings.Index(s, "gzip              on;")
+	brotliIdx := strings.Index(s, "brotli            on;")
+	if gzipIdx < 0 || brotliIdx < 0 || brotliIdx < gzipIdx {
+		t.Errorf("brotli block must follow gzip block; gzip=%d brotli=%d", gzipIdx, brotliIdx)
+	}
 }
 
 func mustContain(t *testing.T, s, sub string) {

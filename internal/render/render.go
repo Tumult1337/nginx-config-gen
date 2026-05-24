@@ -103,15 +103,21 @@ func Vhost(cfg VhostCfg) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// Main renders /etc/nginx/nginx.conf, marker prepended. No variables.
-func Main(now time.Time) ([]byte, error) {
+// MainCfg controls optional features in the global nginx.conf.
+type MainCfg struct {
+	Now    time.Time
+	Brotli bool // emit brotli {filter,static} directives (requires the dynamic module)
+}
+
+// Main renders /etc/nginx/nginx.conf, marker prepended.
+func Main(cfg MainCfg) ([]byte, error) {
 	t := tpls.Lookup("main.tmpl")
 	if t == nil {
 		return nil, fmt.Errorf("template main.tmpl not found")
 	}
 	var buf bytes.Buffer
-	buf.WriteString(marker.RenderMain(now))
-	if err := t.Execute(&buf, nil); err != nil {
+	buf.WriteString(marker.RenderMain(cfg.Now))
+	if err := t.Execute(&buf, cfg); err != nil {
 		return nil, fmt.Errorf("render main.tmpl: %w", err)
 	}
 	return buf.Bytes(), nil

@@ -57,6 +57,16 @@ emits the correct HTTP/2 directive automatically:
 
 `--dry-run` skips detection and defaults to the modern syntax.
 
+### Brotli (auto-install)
+
+`--main` emits a `brotli` block alongside `gzip` when the dynamic module is
+present (`/etc/nginx/modules-enabled/*brotli*.conf`). If it isn't, the tool
+tries a best-effort `apt-get install -y libnginx-mod-http-brotli-filter
+libnginx-mod-http-brotli-static` first. On non-apt hosts or install failure,
+a warning is printed and `nginx.conf` is rendered gzip-only (so `nginx -t`
+still passes). `--dry-run` always shows brotli (assumes a real apply would
+install it).
+
 ### Wildcard certs (auto-detect)
 
 `--ssl=true` resolves the cert dir by walking up the host's domain labels:

@@ -356,7 +356,12 @@ func rollback(d Deps, target, backup string) {
 
 func runMain(d Deps, force, dryRun, noReload bool) int {
 	migrateLegacyAllowConf(d.Stderr)
-	rendered, err := render.Main(d.Now())
+	// Dry-run assumes brotli would be installed on a real apply.
+	brotli := true
+	if !dryRun {
+		brotli = ensureBrotli(d)
+	}
+	rendered, err := render.Main(render.MainCfg{Now: d.Now(), Brotli: brotli})
 	if err != nil {
 		fmt.Fprintln(d.Stderr, "render main:", err)
 		return exitSystemErr
@@ -654,6 +659,46 @@ func runSysctl(d Deps, force, dryRun, noReload bool) int {
 		"result":          "ok",
 	})
 	return exitOK
+}
+
+// ---- brotli module ----
+
+// brotliPackages: Debian/Ubuntu split packages. A wrapper metapackage
+// (libnginx-mod-brotli) exists on some distros but isn't universal —
+// installing the two split packages directly works everywhere apt does.
+var brotliPackages = []string{
+	"libnginx-mod-http-brotli-filter",
+	"libnginx-mod-http-brotli-static",
+}
+
+// brotliModuleLoaded reports whether nginx will load the brotli module on
+// startup — detected by a load_module conf in /etc/nginx/modules-enabled/.
+// Custom builds that compile brotli in statically aren't detected here;
+// those operators can edit the template directly.
+func brotliModuleLoaded() bool {
+	matches, _ := filepath.Glob("/etc/nginx/modules-enabled/*brotli*.conf")
+	return len(matches) > 0
+}
+
+// ensureBrotli returns true if the brotli dynamic module is loaded after a
+// best-effort apt-get install. On non-apt hosts or install failure, returns
+// false and emits a warning — runMain then renders without brotli so
+// `nginx -t` still passes.
+func ensureBrotli(d Deps) bool {
+	if brotliModuleLoaded() {
+		return true
+	}
+	args := append([]string{"install", "-y"}, brotliPackages...)
+	if out, err := d.Exec.Run("apt-get", args...); err != nil {
+		fmt.Fprintln(d.Stderr, "warning: brotli auto-install failed; rendering nginx.conf without brotli")
+		fmt.Fprintln(d.Stderr, "apt-get output:", strings.TrimSpace(string(out)))
+		return false
+	}
+	if !brotliModuleLoaded() {
+		fmt.Fprintln(d.Stderr, "warning: brotli module not present after install; rendering nginx.conf without brotli")
+		return false
+	}
+	return true
 }
 
 // ---- legacy migration ----
