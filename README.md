@@ -82,6 +82,13 @@ nginx-gen --upgrade       [--force] [--dry-run] [--no-reload]
     apt-upgrade nginx, auto-rebuild brotli if version drifted, re-render
     nginx.conf, restart. Idempotent: no-op when nothing changed.
 
+nginx-gen --convert       [--channel=mainline|stable] [--brotli=auto|on|off]
+                          [--dry-run] [--no-reload]
+    Best-effort migration of an existing nginx install (e.g. Debian's
+    apt nginx) into nginx-gen's managed setup. Snapshots /etc/nginx + writes
+    an executable rollback.sh BEFORE touching anything, then runs --install
+    + --sysctl. On any failure, prints the rollback command prominently.
+
 nginx-gen --version-check
     Print nginx + brotli ABI sync status. Exit 0 if in sync, 1 on drift.
     Suitable for cron / monit / Nagios.
@@ -254,6 +261,58 @@ runs `nginx -t`, restarts.
 
 ```bash
 find /var/backups/nginx-gen -mtime +30 -delete
+```
+
+## Migrating a host already running nginx (Debian apt or other)
+
+```bash
+nginx-gen --convert --brotli=on        # one command, safe by construction
+```
+
+What this does:
+
+1. **Snapshots** `/etc/nginx` (full `cp -a`) plus current `nginx -T` output
+   and the installed nginx package version to
+   `/var/backups/nginx-gen/convert/<timestamp>/`.
+2. **Writes an executable `rollback.sh`** next to the snapshot. Runs `cp -a`
+   the snapshot back, removes nginx.org's apt source + pin, and reinstalls
+   the previously-pinned nginx via apt (using `--allow-downgrades` since
+   nginx.org's version is typically newer).
+3. **Inventories** which files in `sites-enabled/`, `conf.d/`, `snippets/`
+   are operator-owned (no nginx-gen marker) so you know what was preserved
+   untouched vs. what was overwritten.
+4. **Runs `--install`** (adds nginx.org repo, apt-upgrades nginx to upstream,
+   renders managed `nginx.conf` with `--force`, builds brotli if `--brotli=on`)
+   then **`--sysctl`**.
+5. **Final `nginx -t` + restart** before declaring success.
+
+If any step fails, the rollback command is printed prominently. You can also
+just stop the world and run the rollback script:
+
+```bash
+sudo bash /var/backups/nginx-gen/convert/<ts>/rollback.sh
+```
+
+**What's preserved automatically:**
+- All vhost files in `sites-available/` and `sites-enabled/` (untouched —
+  they keep working as-is). You can optionally re-render them later with
+  `nginx-gen <host> <target>` to put the managed marker on them.
+- Everything in `conf.d/` (the new template includes this dir).
+- Everything in `snippets/`.
+- Cert dirs under `/etc/letsencrypt`, `/etc/ssl/cf`, etc.
+
+**What's NOT preserved automatically:**
+- Custom http-scope directives (`map`, `geo`, `log_format`, `upstream`) that
+  were inside your hand-written `nginx.conf` — the managed template replaces
+  the file entirely. After conversion, `less` the snapshotted
+  `<backup>/etc-nginx/nginx.conf` and move anything you need into
+  `/etc/nginx/conf.d/00-custom.conf` (auto-loaded, survives `--main`).
+
+**Preview before committing** — `--dry-run` prints the full plan without
+touching anything:
+
+```bash
+sudo nginx-gen --convert --brotli=on --dry-run
 ```
 
 ## Examples

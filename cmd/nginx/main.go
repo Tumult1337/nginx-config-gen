@@ -118,6 +118,7 @@ func Run(args []string, d Deps) int {
 	doBootstrap := fs.Bool("bootstrap", false, "first-time host setup: --install + --sysctl in one shot (idempotent, safe to rerun)")
 	doUpgrade   := fs.Bool("upgrade", false, "apt-upgrade nginx, rebuild brotli if version drifted, re-render nginx.conf, restart")
 	doVersionCheck := fs.Bool("version-check", false, "print nginx + brotli ABI sync status; exit 1 on drift (suitable for cron/nagios)")
+	doConvert := fs.Bool("convert", false, "best-effort migration of an existing (Debian/other) nginx install into nginx-gen's managed setup; snapshots /etc/nginx + writes a rollback script before touching anything")
 	channel  := fs.String("channel", "mainline", "nginx.org channel: mainline | stable (only used with --install / --bootstrap)")
 	useSSL   := fs.Bool("ssl", true, "enable SSL listener (HTTP→HTTPS redirect + 443)")
 	allowFlag := fs.String("allow", "", "cf | comma-separated CIDRs (or bare IPs)")
@@ -203,6 +204,17 @@ func Run(args []string, d Deps) int {
 			return exitUserError
 		}
 		return runVersionCheck(d)
+	case *doConvert:
+		if len(pos) != 0 {
+			fmt.Fprintln(d.Stderr, "usage: nginx-gen --convert  (no positional args)")
+			return exitUserError
+		}
+		mode, err := parseBrotliMode(*brotli)
+		if err != nil {
+			fmt.Fprintln(d.Stderr, err)
+			return exitUserError
+		}
+		return runConvert(d, *channel, mode, *dryRun, *noReload)
 	}
 
 	// Vhost mode
@@ -227,6 +239,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  nginx-gen --bootstrap  [--channel=mainline|stable] [--brotli=auto|on|off] [--force] [--dry-run] [--no-reload]")
 	fmt.Fprintln(w, "  nginx-gen --upgrade    [--force] [--dry-run] [--no-reload]")
 	fmt.Fprintln(w, "  nginx-gen --version-check   (exit 0 if nginx+brotli ABIs match; 1 on drift)")
+	fmt.Fprintln(w, "  nginx-gen --convert    [--channel=mainline|stable] [--brotli=auto|on|off] [--dry-run] [--no-reload]")
 }
 
 // ---- vhost ----
@@ -1073,6 +1086,257 @@ func runVersionCheck(d Deps) int {
 		"brotli built against: %s  DRIFT — nginx is %s. Run `nginx-gen --upgrade` (or `--brotli-build --force`).\n",
 		builtVer, nginxVer)
 	return exitUserError
+}
+
+// ---- convert ----
+
+const convertBackupRoot = "/var/backups/nginx-gen/convert"
+
+// runConvert migrates an existing (Debian or other) nginx install into
+// nginx-gen's managed setup, in the safest way possible:
+//
+//   1. Snapshot /etc/nginx (cp -a) + nginx -T + dpkg state to a timestamped
+//      backup dir.
+//   2. Write an executable rollback.sh next to the snapshot.
+//   3. Run --install (which itself rewrites nginx.conf with --force, deletes
+//      the upstream stub, optionally builds brotli) then --sysctl.
+//
+// Vhost files in sites-enabled/ are NOT rewritten — the caller can re-render
+// them with `nginx-gen <host> <target>` afterwards to put the managed
+// marker on them, but they keep working as-is. Custom http-scope directives
+// (map, geo, log_format, upstream) that were in the operator's hand-written
+// nginx.conf are *not* automatically extracted — they're preserved only as
+// the snapshotted nginx.conf, and the operator should grep through it and
+// move anything they need into /etc/nginx/conf.d/<name>.conf.
+//
+// On --install failure, the rollback script path is printed prominently.
+func runConvert(d Deps, channelStr string, brotliMode BrotliMode, dryRun, noReload bool) int {
+	if _, err := parseChannel(channelStr); err != nil {
+		fmt.Fprintln(d.Stderr, err)
+		return exitUserError
+	}
+
+	if dryRun {
+		printConvertRecipe(d.Stdout, channelStr, brotliMode)
+		return exitOK
+	}
+	if os.Geteuid() != 0 {
+		fmt.Fprintln(d.Stderr, "--convert requires root (snapshots /etc/nginx + apt-get + writes to /etc)")
+		return exitUserError
+	}
+
+	if _, err := os.Stat("/etc/nginx"); errors.Is(err, fs.ErrNotExist) {
+		fmt.Fprintln(d.Stderr, "no /etc/nginx found — nothing to convert. Use --bootstrap for a clean install.")
+		return exitUserError
+	}
+
+	// Already-managed guard. If our marker is on nginx.conf, the host is
+	// already in our setup; --convert would do nothing useful. Suggest the
+	// correct command instead.
+	if data, err := os.ReadFile(d.Layout.MainConfPath); err == nil {
+		if bytes.HasPrefix(data, []byte(marker.FirstLine)) {
+			fmt.Fprintln(d.Stderr, "nginx.conf already managed by nginx-gen — nothing to convert.")
+			fmt.Fprintln(d.Stderr, "       use --upgrade to refresh, or --main to re-render.")
+			return exitOK
+		}
+	}
+
+	ts := d.Now().UTC().Format("20060102T150405Z")
+	backupDir := filepath.Join(convertBackupRoot, ts)
+	if err := os.MkdirAll(backupDir, 0700); err != nil {
+		fmt.Fprintln(d.Stderr, "create backup dir:", err)
+		return exitSystemErr
+	}
+	fmt.Fprintf(d.Stderr, "snapshotting /etc/nginx → %s/etc-nginx/ ...\n", backupDir)
+	if out, err := d.Exec.Run("cp", "-a", "/etc/nginx", filepath.Join(backupDir, "etc-nginx")); err != nil {
+		fmt.Fprintln(d.Stderr, "snapshot failed:", err)
+		fmt.Fprintln(d.Stderr, strings.TrimSpace(string(out)))
+		return exitSystemErr
+	}
+
+	// Capture nginx -T (best-effort — config may be broken already, in
+	// which case nginx -T errors but we still proceed).
+	if out, err := d.Exec.Run("nginx", "-T"); err == nil && len(out) > 0 {
+		_ = os.WriteFile(filepath.Join(backupDir, "nginx-T.before.txt"), out, 0644)
+	}
+
+	// Capture installed nginx version for the rollback pin.
+	var prevPkgVer string
+	if out, err := d.Exec.Run("dpkg-query", "-W", "-f=${Version}", "nginx"); err == nil {
+		prevPkgVer = strings.TrimSpace(string(out))
+		if prevPkgVer != "" {
+			_ = os.WriteFile(filepath.Join(backupDir, "nginx-pkg-version.before.txt"),
+				[]byte(prevPkgVer+"\n"), 0644)
+		}
+	}
+
+	// Inventory unmanaged files that will keep working untouched. Helpful
+	// for the operator to know what's been preserved vs replaced.
+	inventory := writeConvertInventory(backupDir)
+	if inventory != "" {
+		fmt.Fprintln(d.Stderr, "preserved unmanaged files inventoried at:", inventory)
+	}
+
+	rollbackPath := filepath.Join(backupDir, "rollback.sh")
+	if err := writeRollbackScript(rollbackPath, backupDir, prevPkgVer); err != nil {
+		fmt.Fprintln(d.Stderr, "write rollback script:", err)
+		return exitSystemErr
+	}
+	fmt.Fprintf(d.Stderr, "rollback ready: sudo bash %s\n", rollbackPath)
+
+	fmt.Fprintln(d.Stderr, "==> step 1/2: install")
+	if code := runInstall(d, channelStr, brotliMode, false, true); code != exitOK {
+		fmt.Fprintln(d.Stderr, "")
+		fmt.Fprintln(d.Stderr, "==> CONVERSION FAILED at --install. To revert to pre-conversion state:")
+		fmt.Fprintf(d.Stderr, "       sudo bash %s\n", rollbackPath)
+		return code
+	}
+
+	fmt.Fprintln(d.Stderr, "==> step 2/2: sysctl")
+	if code := runSysctl(d, true, false, noReload); code != exitOK {
+		fmt.Fprintln(d.Stderr, "")
+		fmt.Fprintln(d.Stderr, "==> sysctl step failed — install completed but tuning not applied.")
+		fmt.Fprintf(d.Stderr, "       to revert everything: sudo bash %s\n", rollbackPath)
+		fmt.Fprintln(d.Stderr, "       to retry just sysctl: sudo nginx-gen --sysctl --force")
+		return code
+	}
+
+	fmt.Fprintln(d.Stderr, "")
+	fmt.Fprintln(d.Stderr, "==> conversion complete.")
+	fmt.Fprintln(d.Stderr, "")
+	fmt.Fprintln(d.Stderr, "  Custom http-scope directives (map/geo/log_format/upstream) you had")
+	fmt.Fprintln(d.Stderr, "  in /etc/nginx/nginx.conf are NOT carried over automatically. Recover")
+	fmt.Fprintln(d.Stderr, "  them from the snapshot and drop into /etc/nginx/conf.d/*.conf:")
+	fmt.Fprintf(d.Stderr, "       less %s/etc-nginx/nginx.conf\n", backupDir)
+	fmt.Fprintln(d.Stderr, "")
+	fmt.Fprintln(d.Stderr, "  Diff against pre-conversion view:")
+	fmt.Fprintf(d.Stderr, "       diff %s/nginx-T.before.txt <(nginx -T 2>/dev/null)\n", backupDir)
+	fmt.Fprintln(d.Stderr, "")
+	fmt.Fprintf(d.Stderr, "  Rollback (if anything is broken): sudo bash %s\n", rollbackPath)
+
+	logEvent(d.Stderr, d.Now(), "convert", "", map[string]any{
+		"backup":     backupDir,
+		"rollback":   rollbackPath,
+		"channel":    channelStr,
+		"brotli":     brotliMode.String(),
+		"prev_nginx": prevPkgVer,
+		"result":     "ok",
+	})
+	return exitOK
+}
+
+// writeConvertInventory walks sites-available/, conf.d/, snippets/ and
+// records which files lack our marker (i.e. operator-owned, will keep
+// working). Returns the inventory file path or "" on failure.
+func writeConvertInventory(backupDir string) string {
+	var b bytes.Buffer
+	for _, dir := range []string{
+		"/etc/nginx/sites-available", "/etc/nginx/sites-enabled",
+		"/etc/nginx/conf.d", "/etc/nginx/snippets",
+	} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			path := filepath.Join(dir, e.Name())
+			data, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			tag := "unmanaged"
+			if bytes.HasPrefix(data, []byte(marker.FirstLine)) {
+				tag = "managed"
+			}
+			fmt.Fprintf(&b, "%-9s %s\n", tag, path)
+		}
+	}
+	if b.Len() == 0 {
+		return ""
+	}
+	out := filepath.Join(backupDir, "files-inventory.txt")
+	if err := os.WriteFile(out, b.Bytes(), 0644); err != nil {
+		return ""
+	}
+	return out
+}
+
+// writeRollbackScript emits an executable script that restores /etc/nginx
+// from the snapshot, removes the nginx.org apt repo files, and reinstalls
+// the previously-pinned nginx version (if known). Idempotent.
+func writeRollbackScript(path, backupDir, prevPkgVer string) error {
+	pinClause := ""
+	if prevPkgVer != "" {
+		pinClause = fmt.Sprintf("=%s", prevPkgVer)
+	}
+	content := fmt.Sprintf(`#!/usr/bin/env bash
+# Generated by nginx-gen --convert.
+# Restores /etc/nginx and the previously-installed nginx package.
+# Idempotent: safe to rerun.
+
+set -euo pipefail
+
+BACKUP=%q
+PREV_PKG=%q
+
+if [[ ! -d "$BACKUP/etc-nginx" ]]; then
+    echo "ERROR: snapshot not found at $BACKUP/etc-nginx" >&2
+    exit 1
+fi
+
+echo "==> stopping nginx (if running)"
+systemctl stop nginx 2>/dev/null || true
+
+echo "==> removing nginx.org apt source + pin"
+rm -f /etc/apt/sources.list.d/nginx.list
+rm -f /etc/apt/preferences.d/99nginx
+# Keyring left in place — harmless and reusable.
+
+echo "==> restoring /etc/nginx from snapshot"
+# Move (not delete) current state aside as a second-level safety net.
+if [[ -d /etc/nginx ]]; then
+    mv /etc/nginx "/etc/nginx.rolled-back.$(date +%%s)"
+fi
+cp -a "$BACKUP/etc-nginx" /etc/nginx
+
+echo "==> apt update + reinstalling nginx${PREV_PKG:+ ($PREV_PKG)}"
+apt-get update
+# --allow-downgrades because the nginx.org version installed by --convert
+# is likely newer than the Debian package we're restoring.
+if [[ -n "$PREV_PKG" ]]; then
+    apt-get install -y --allow-downgrades --reinstall "nginx=$PREV_PKG"
+else
+    apt-get install -y --reinstall nginx
+fi
+
+echo "==> validating restored config"
+nginx -t
+
+echo "==> starting nginx"
+systemctl start nginx
+
+echo "rollback complete. Pre-conversion state restored."
+`, backupDir, pinClause)
+	return os.WriteFile(path, []byte(content), 0755)
+}
+
+func printConvertRecipe(w io.Writer, channelStr string, mode BrotliMode) {
+	fmt.Fprintln(w, "# would migrate an existing nginx install to nginx-gen's managed setup")
+	fmt.Fprintln(w, "mkdir -p "+convertBackupRoot+"/<TS>")
+	fmt.Fprintln(w, "cp -a /etc/nginx          → <backup>/etc-nginx/")
+	fmt.Fprintln(w, "nginx -T                  → <backup>/nginx-T.before.txt")
+	fmt.Fprintln(w, "dpkg-query nginx version  → <backup>/nginx-pkg-version.before.txt")
+	fmt.Fprintln(w, "[managed/unmanaged file inventory] → <backup>/files-inventory.txt")
+	fmt.Fprintln(w, "write executable rollback script   → <backup>/rollback.sh")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "==> step 1/2: --install (channel="+channelStr+", brotli="+mode.String()+")")
+	fmt.Fprintln(w, "==> step 2/2: --sysctl --force")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "on any step failure: prints `sudo bash <backup>/rollback.sh` prominently")
+	fmt.Fprintln(w, "vhost files in sites-enabled/ are NOT rewritten; they keep working as-is")
 }
 
 // ---- bootstrap ----

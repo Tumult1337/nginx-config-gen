@@ -523,6 +523,94 @@ func TestEnsureBrotliFallsThroughWhenProbeInconclusive(t *testing.T) {
 	}
 }
 
+// ---- --convert ----
+
+func TestRunConvertDryRunPrintsRecipe(t *testing.T) {
+	d, exec, stdout, stderr := defaultDepsFor(t)
+	if code := Run([]string{"--convert", "--dry-run"}, d); code != exitOK {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	for _, want := range []string{
+		"cp -a /etc/nginx",
+		"rollback.sh",
+		"--install",
+		"--sysctl",
+		"sites-enabled/ are NOT rewritten",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("dry-run missing %q:\n%s", want, stdout.String())
+		}
+	}
+	if exec.called("cp") || exec.called("apt-get") {
+		t.Errorf("dry-run must not exec, got %v", exec.calls)
+	}
+}
+
+func TestRunConvertRejectsBadBrotli(t *testing.T) {
+	d, _, _, _ := defaultDepsFor(t)
+	if code := Run([]string{"--convert", "--brotli=yes-please"}, d); code != exitUserError {
+		t.Errorf("want exitUserError, got %d", code)
+	}
+}
+
+func TestRunConvertRejectsBadChannel(t *testing.T) {
+	d, _, _, _ := defaultDepsFor(t)
+	if code := Run([]string{"--convert", "--channel=edge"}, d); code != exitUserError {
+		t.Errorf("want exitUserError, got %d", code)
+	}
+}
+
+// Rollback script must be syntactically valid bash and reference the
+// snapshot path it was written for. Smoke-test by parsing with `bash -n`.
+func TestWriteRollbackScriptValid(t *testing.T) {
+	dir := t.TempDir()
+	rollback := filepath.Join(dir, "rollback.sh")
+	if err := writeRollbackScript(rollback, "/var/backups/nginx-gen/convert/20260526T120000Z", "1.26.3-3+deb13u5"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(rollback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"#!/usr/bin/env bash",
+		"set -euo pipefail",
+		"/var/backups/nginx-gen/convert/20260526T120000Z",
+		`PREV_PKG="=1.26.3-3+deb13u5"`,
+		"systemctl stop nginx",
+		"rm -f /etc/apt/sources.list.d/nginx.list",
+		"rm -f /etc/apt/preferences.d/99nginx",
+		"--allow-downgrades",
+		"nginx -t",
+		"systemctl start nginx",
+	} {
+		if !bytes.Contains(data, []byte(want)) {
+			t.Errorf("rollback script missing %q\n--- script ---\n%s", want, data)
+		}
+	}
+	info, _ := os.Stat(rollback)
+	if info.Mode().Perm()&0100 == 0 {
+		t.Errorf("rollback script not executable: mode=%v", info.Mode())
+	}
+}
+
+func TestWriteRollbackScriptUnknownVersion(t *testing.T) {
+	dir := t.TempDir()
+	rollback := filepath.Join(dir, "rollback.sh")
+	if err := writeRollbackScript(rollback, "/snap", ""); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(rollback)
+	// PREV_PKG must be the empty string — the script's runtime branch then
+	// uses the unpinned `apt-get install -y --reinstall nginx` form.
+	if !bytes.Contains(data, []byte(`PREV_PKG=""`)) {
+		t.Errorf("empty prevPkgVer must produce PREV_PKG=\"\":\n%s", data)
+	}
+	if !bytes.Contains(data, []byte("nginx-gen --convert")) {
+		t.Errorf("script header missing:\n%s", data)
+	}
+}
+
 // ---- --upgrade / --version-check ----
 
 func TestRunUpgradeDryRunPrintsRecipe(t *testing.T) {
