@@ -576,17 +576,28 @@ func TestWriteRollbackScriptValid(t *testing.T) {
 		"#!/usr/bin/env bash",
 		"set -euo pipefail",
 		"/var/backups/nginx-gen/convert/20260526T120000Z",
-		`PREV_PKG="=1.26.3-3+deb13u5"`,
+		// PREV_PKG must hold the BARE version. The leading `=` is hard-coded
+		// into the apt command — passing a pre-equalsed value produces
+		// `nginx==1.2.3`, which apt parses as package name `nginx=` and
+		// errors with "Unable to locate package nginx=".
+		`PREV_PKG="1.26.3-3+deb13u5"`,
+		`apt-get install -y --allow-downgrades --reinstall "nginx=$PREV_PKG"`,
 		"systemctl stop nginx",
 		"rm -f /etc/apt/sources.list.d/nginx.list",
 		"rm -f /etc/apt/preferences.d/99nginx",
-		"--allow-downgrades",
 		"nginx -t",
 		"systemctl start nginx",
 	} {
 		if !bytes.Contains(data, []byte(want)) {
 			t.Errorf("rollback script missing %q\n--- script ---\n%s", want, data)
 		}
+	}
+	// Belt-and-suspenders: forbid the double-equals form anywhere.
+	if bytes.Contains(data, []byte(`nginx==`)) {
+		t.Errorf("script contains forbidden 'nginx==' (double-equals bug):\n%s", data)
+	}
+	if bytes.Contains(data, []byte(`PREV_PKG="=`)) {
+		t.Errorf("PREV_PKG must hold bare version, no leading `=`:\n%s", data)
 	}
 	info, _ := os.Stat(rollback)
 	if info.Mode().Perm()&0100 == 0 {
